@@ -186,7 +186,8 @@ def render(item, easy_mode, key_prefix):
     if t in ("mcq","case","pattern"):
         # Use selectbox instead of radio to avoid red "required" highlighting
         choice = select_with_placeholder("Antwort:", item["options"], key=f"{key_prefix}{item['id']}_mcq")
-        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
+btn_key = f"{key_prefix}{item['id']}_submit_{st.session_state.get('flow_i', 0)}"
+if st.button("Weiter", key=btn_key):
             if choice is None:
                 st.warning("Bitte wähle eine Option.")
                 return None
@@ -198,7 +199,8 @@ def render(item, easy_mode, key_prefix):
 
     if t=="cloze":
         choice = select_with_placeholder("Wort:", item["options"], key=f"{key_prefix}{item['id']}_cloze")
-        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
+btn_key = f"{key_prefix}{item['id']}_submit_{st.session_state.get('flow_i', 0)}"
+if st.button("Weiter", key=btn_key):
             if choice is None:
                 st.warning("Bitte wähle ein Wort.")
                 return None
@@ -214,7 +216,8 @@ def render(item, easy_mode, key_prefix):
         for pos in range(len(steps)):
             ch = select_with_placeholder(f"Position {pos+1}", steps, key=f"{key_prefix}{item['id']}_pos{pos}")
             chosen_steps.append(ch)
-        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
+btn_key = f"{key_prefix}{item['id']}_submit_{st.session_state.get('flow_i', 0)}"
+if st.button("Weiter", key=btn_key):
             if any(c is None for c in chosen_steps):
                 st.warning("Bitte fülle alle Positionen aus.")
                 return None
@@ -234,7 +237,8 @@ def render(item, easy_mode, key_prefix):
         right=[r for _,r in item["pairs"]]
         for left,_ in item["pairs"]:
             responses[left]=select_with_placeholder(left, right, key=f"{key_prefix}{item['id']}_{left}")
-        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
+btn_key = f"{key_prefix}{item['id']}_submit_{st.session_state.get('flow_i', 0)}"
+if st.button("Weiter", key=btn_key):
             if any(v is None for v in responses.values()):
                 st.warning("Bitte ordne alle Begriffe zu.")
                 return None
@@ -247,7 +251,8 @@ def render(item, easy_mode, key_prefix):
 
     # short
     answer=st.text_area("Deine Antwort:", key=f"{key_prefix}{item['id']}_short")
-    if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
+btn_key = f"{key_prefix}{item['id']}_submit_{st.session_state.get('flow_i', 0)}"
+if st.button("Weiter", key=btn_key):
         text=(answer or "").lower()
         kws=item.get("keywords",[])
         hits=sum(1 for kw in kws if kw.lower() in text)
