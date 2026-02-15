@@ -162,7 +162,7 @@ def ensure_data_tables(c: sqlite3.Connection):
         content BLOB NOT NULL,
         created_at TEXT NOT NULL
     )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS topic_texts(
+    c.execute("""CREATE TABLE IF NOT EXISTS topic_texts(
         field_id TEXT NOT NULL,
         topic TEXT NOT NULL,
         level INTEGER NOT NULL,
