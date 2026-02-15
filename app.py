@@ -965,7 +965,7 @@ with tabs[1]:
 
     # 4) Materials
     st.markdown("### 4) Thementexte (Infotexte) bearbeiten")
-        st.caption("Hier kannst du pro Lernfeld + Thema kurze Infotexte in drei Sprachebenen hinterlegen. Diese werden im adaptiven Üben vor den Aufgaben angezeigt.")
+    st.caption("Hier kannst du pro Lernfeld + Thema kurze Infotexte in drei Sprachebenen hinterlegen. Diese werden im adaptiven Üben vor den Aufgaben angezeigt.")
         topics_df = list_topics(ci)
         if topics_df.empty:
             st.info("Keine Themen gefunden.")
