@@ -10,9 +10,9 @@ import streamlit as st
 # =========================
 # Config
 # =========================
-DB_PATH = "gpa_adaptiv_v2_seed.db"   # put DB next to app.py (same folder)
-APP_TITLE = "GPA Adaptiv – Web-App (Prototyp)"
-APP_SUBTITLE = "Diagnostik → Profil → adaptive Aufgaben · spielerisch + prüfungsnah · Lehrkraft-Dashboard"
+DB_PATH = "gpa_adaptiv_v2_seed.db"   # DB must sit next to this file in the repo
+APP_TITLE = "GPA Lernapp"
+APP_SUBTITLE = "Lernfeld wählen → Lernstand erheben → passende Aufgaben"
 
 WEIGHTS = {1: 1.0, 2: 1.3, 3: 1.7}
 
@@ -30,20 +30,31 @@ LEARN_FIELDS = [
 ]
 DOMAINS = [
     ("OPS","Operatoren"),
-    ("SPR","Sprache (Verstehen/Schreiben)"),
-    ("KOG","Kognition (Struktur/Sequenz/Priorität)"),
-    ("FACH","Fachwissen (Pflege/Medizin)"),
+    ("SPR","Sprache"),
+    ("KOG","Denken & Reihenfolgen"),
+    ("FACH","Fachwissen"),
 ]
 
 lf_name = dict(LEARN_FIELDS)
 domain_name = dict(DOMAINS)
 
+# Friendly labels for task types (hide internal names)
+TYPE_LABEL = {
+    "mcq": "Quiz",
+    "case": "Fallbeispiel",
+    "cloze": "Lückentext",
+    "cloze2": "Lückentext",
+    "match": "Zuordnen",
+    "order": "Reihenfolge",
+    "short": "Kurzantwort",
+    "pattern": "Quiz",
+}
+
 # =========================
 # DB helpers
 # =========================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    return conn
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def ensure_tables(conn):
     conn.execute("""
@@ -71,8 +82,7 @@ def ensure_tables(conn):
 
 def load_items(conn) -> List[Dict[str, Any]]:
     df = pd.read_sql_query("SELECT payload_json FROM items", conn)
-    items = [json.loads(x) for x in df["payload_json"].tolist()]
-    return items
+    return [json.loads(x) for x in df["payload_json"].tolist()]
 
 def upsert_user(conn, user_id: str, role: str, display_name: str, class_code: str):
     conn.execute("""
@@ -85,7 +95,7 @@ def upsert_user(conn, user_id: str, role: str, display_name: str, class_code: st
     """, (user_id, role, display_name, class_code, datetime.utcnow().isoformat()))
     conn.commit()
 
-def log_attempt(conn, user_id: str, class_code: str, item: Dict[str, Any], correct: bool, response: Dict[str, Any]):
+def log_attempt(conn, user_id: str, class_code: str, item: Dict[str, Any], correct: bool, response: Dict[str, Any], mode: str):
     conn.execute("""
     INSERT INTO attempts(user_id, class_code, item_id, field_id, domain_id, difficulty, correct, response_json, created_at)
     VALUES(?,?,?,?,?,?,?,?,?)
@@ -97,7 +107,7 @@ def log_attempt(conn, user_id: str, class_code: str, item: Dict[str, Any], corre
         item["domain"],
         int(item["difficulty"]),
         int(bool(correct)),
-        json.dumps(response, ensure_ascii=False),
+        json.dumps({"mode": mode, **response}, ensure_ascii=False),
         datetime.utcnow().isoformat()
     ))
     conn.commit()
@@ -139,87 +149,96 @@ def compute_profile(attempts_df: pd.DataFrame) -> Dict[Tuple[str, str], Dict[str
     out: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for key, v in agg.items():
         acc = v["c"] / max(v["w"], 1e-9)
-        mastery = acc
-        if mastery < 0.45:
+        if acc < 0.45:
             level = 1
-        elif mastery < 0.75:
+        elif acc < 0.75:
             level = 2
         else:
             level = 3
-        out[key] = {
-            "accuracy": round(acc, 2),
-            "mastery": round(mastery, 2),
-            "level": level,
-            "n": int(v["n"])
-        }
+        out[key] = {"accuracy": round(acc, 2), "level": level, "n": int(v["n"])}
     return out
+
+def pick_items_for_diagnostic(items: List[Dict[str, Any]], field_id: str, n: int) -> List[Dict[str, Any]]:
+    domains = ["OPS", "SPR", "KOG", "FACH"]
+    per_domain = max(2, n // 5)
+    chosen: List[Dict[str, Any]] = []
+    for d in domains:
+        cand = [it for it in items if it["field"] == field_id and it["domain"] == d]
+        if cand:
+            chosen.extend(random.sample(cand, k=min(per_domain, len(cand))))
+    rest = n - len(chosen)
+    cand_all = [it for it in items if it["field"] == field_id]
+    if rest > 0 and cand_all:
+        chosen.extend(random.sample(cand_all, k=min(rest, len(cand_all))))
+    random.shuffle(chosen)
+    return chosen[:n]
 
 def pick_items_adaptive(items: List[Dict[str, Any]],
                         profile: Dict[Tuple[str, str], Dict[str, Any]],
-                        field_id: Optional[str],
-                        focus_domain: Optional[str],
+                        field_id: str,
                         already_seen: set,
-                        k: int = 10) -> List[Dict[str, Any]]:
-    pool = []
-    for it in items:
-        if field_id and it["field"] != field_id:
-            continue
-        if focus_domain and it["domain"] != focus_domain:
-            continue
-        target = profile.get((it["field"], it["domain"]), {}).get("level", 1)
-        dist = abs(int(it["difficulty"]) - int(target))
-        seen_penalty = 0.6 if it["id"] in already_seen else 0.0
-        score = dist + seen_penalty + random.random() * 0.15
-        pool.append((score, it))
+                        k: int = 8) -> List[Dict[str, Any]]:
+    dom_levels = {}
+    for dom in ["OPS", "SPR", "KOG", "FACH"]:
+        dom_levels[dom] = profile.get((field_id, dom), {}).get("level", 1)
 
-    pool.sort(key=lambda x: x[0])
+    sorted_domains = sorted(dom_levels.items(), key=lambda x: x[1])  # low first
+    dom_plan = []
+    for dom, lvl in sorted_domains:
+        dom_plan.extend([dom] * (4 - min(3, lvl)))  # lvl1 -> 3 slots, lvl2 -> 2, lvl3 ->1
+    if not dom_plan:
+        dom_plan = ["OPS","SPR","KOG","FACH"]
 
-    chosen = []
-    for _, it in pool:
-        if it["id"] in already_seen and len(chosen) < k - 2:
-            continue
-        chosen.append(it)
-        if len(chosen) >= k:
-            break
-
-    # mix: add one easy and one challenge if possible
-    if chosen:
-        easy = [it for it in pool if it[1]["difficulty"] == 1]
-        hard = [it for it in pool if it[1]["difficulty"] == 3]
-        if easy:
-            chosen = [easy[0][1]] + chosen[:-1]
-        if hard and len(chosen) >= 3:
-            chosen[-1] = hard[0][1]
-    return chosen[:k]
+    picked = []
+    for _ in range(k):
+        dom = random.choice(dom_plan)
+        target = dom_levels.get(dom, 1)
+        pool = []
+        for it in items:
+            if it["field"] != field_id or it["domain"] != dom:
+                continue
+            dist = abs(int(it["difficulty"]) - int(target))
+            seen_penalty = 0.6 if it["id"] in already_seen else 0.0
+            score = dist + seen_penalty + random.random() * 0.2
+            pool.append((score, it))
+        pool.sort(key=lambda x: x[0])
+        if pool:
+            picked.append(pool[0][1])
+            already_seen.add(pool[0][1]["id"])
+    return picked[:k]
 
 # =========================
-# Rendering helpers
+# Rendering
 # =========================
-def simple_language(text: str) -> str:
-    repl = {
-        "Begründe": "Sag warum",
-        "Beurteile": "Entscheide",
-        "Beschreibe": "Erkläre kurz",
-        "Erkläre": "Sag wie und warum",
-        "Leite ab": "Entscheide, was du tust",
-        "Symptom": "Zeichen (was die Person merkt)",
-        "Befund": "Ergebnis (was man misst/prüft)",
-    }
-    out = text
-    for a, b in repl.items():
-        out = out.replace(a, b)
-    return out
+def render_header_card(field_id: str):
+    st.markdown(
+        f"""
+        <div style="padding:14px;border-radius:14px;border:1px solid rgba(0,0,0,.12);">
+          <div style="font-size:14px;opacity:.8;">Ausgewähltes Lernfeld</div>
+          <div style="font-size:22px;font-weight:700;">{field_id} – {lf_name.get(field_id, field_id)}</div>
+          <div style="margin-top:6px;opacity:.85;">1) Lernstand erheben · 2) Üben mit passenden Aufgaben</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def render_task_badge(item: Dict[str, Any]):
+    label = TYPE_LABEL.get(item.get("type",""), "Aufgabe")
+    dom = domain_name.get(item.get("domain",""), item.get("domain",""))
+    diff = int(item.get("difficulty", 1))
+    stars = "⭐" * diff
+    st.caption(f"{label} · {dom} · {stars}")
 
 def render_item(item: Dict[str, Any], easy_mode: bool, key_prefix: str) -> Optional[Dict[str, Any]]:
     prompt = item.get("prompt_easy") if easy_mode and item.get("prompt_easy") else item.get("prompt", "")
-    st.subheader(f"{item['type'].upper()} · {item['field']} · {item['domain']} · Stufe {item['difficulty']}")
+    render_task_badge(item)
     st.write(prompt)
 
     t = item["type"]
 
     if t in ("mcq", "case", "pattern"):
-        choice = st.radio("Antwort wählen:", item["options"], index=None, key=f"{key_prefix}{item['id']}_mcq")
-        if st.button("Abgeben", key=f"{key_prefix}{item['id']}_submit"):
+        choice = st.radio("Antwort:", item["options"], index=None, key=f"{key_prefix}{item['id']}_mcq")
+        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
             if choice is None:
                 st.warning("Bitte wähle eine Option.")
                 return None
@@ -228,8 +247,8 @@ def render_item(item: Dict[str, Any], easy_mode: bool, key_prefix: str) -> Optio
             return {"correct": correct, "response": {"choice": choice}}
 
     if t == "cloze":
-        choice = st.selectbox("Wort wählen:", item["options"], index=None, key=f"{key_prefix}{item['id']}_cloze")
-        if st.button("Abgeben", key=f"{key_prefix}{item['id']}_submit"):
+        choice = st.selectbox("Wort:", item["options"], index=None, key=f"{key_prefix}{item['id']}_cloze")
+        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
             if choice is None:
                 st.warning("Bitte wähle ein Wort.")
                 return None
@@ -238,32 +257,28 @@ def render_item(item: Dict[str, Any], easy_mode: bool, key_prefix: str) -> Optio
             return {"correct": correct, "response": {"choice": choice}}
 
     if t == "order":
-        st.caption("Gib die Reihenfolge als Zahlenfolge ein, z. B. 1-3-2-4")
+        st.caption("Tipp: schreibe z. B. 1-3-2-4")
         for i, s in enumerate(item["steps"], start=1):
             st.write(f"{i}. {s}")
         text = st.text_input("Reihenfolge:", key=f"{key_prefix}{item['id']}_order")
-        if st.button("Abgeben", key=f"{key_prefix}{item['id']}_submit"):
+        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
             try:
                 parts = [int(p.strip()) for p in text.replace("–", "-").split("-")]
                 idx = [p - 1 for p in parts]
                 correct = (idx == item["correct_order"])
-                if correct:
-                    st.success("Richtig ✅")
-                else:
-                    sol = "-".join(str(i + 1) for i in item["correct_order"])
-                    st.error(f"Nicht ganz ❌ · Lösung: {sol}")
+                st.success("Richtig ✅" if correct else "Nicht ganz ❌")
                 return {"correct": correct, "response": {"order": parts}}
             except Exception:
                 st.warning("Bitte als Zahlenfolge eingeben, z. B. 1-3-2-4.")
                 return None
 
     if t == "match":
-        st.caption("Ordne zu (Prototype: pro Begriff auswählbar).")
+        st.caption("Ordne zu:")
         responses = {}
         right_options = [r for (_, r) in item["pairs"]]
         for left, _right in item["pairs"]:
             responses[left] = st.selectbox(left, right_options, index=None, key=f"{key_prefix}{item['id']}_{left}")
-        if st.button("Abgeben", key=f"{key_prefix}{item['id']}_submit"):
+        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
             correct = True
             for left, right in item["pairs"]:
                 if responses.get(left) != right:
@@ -273,22 +288,22 @@ def render_item(item: Dict[str, Any], easy_mode: bool, key_prefix: str) -> Optio
 
     if t == "short":
         answer = st.text_area("Deine Antwort:", key=f"{key_prefix}{item['id']}_short")
-        if st.button("Abgeben", key=f"{key_prefix}{item['id']}_submit"):
+        if st.button("Weiter", key=f"{key_prefix}{item['id']}_submit"):
             text = (answer or "").lower()
             kws = item.get("keywords", [])
             hits = sum(1 for kw in kws if kw.lower() in text)
             correct = hits >= max(1, len(kws) // 4) if kws else (len(text.strip()) > 10)
-            st.success(f"Abgegeben ✅ · (Prototype-Auswertung: {hits} Stichwort-Treffer)")
-            st.info("Kurzantworten: für den Pilotbetrieb ideal mit Rubrik + Lehrkraft-Review.")
+            st.success("Danke ✅")
             return {"correct": correct, "response": {"text": answer, "hits": hits}}
 
-    st.info("Item-Typ noch nicht implementiert.")
+    st.info("Dieser Aufgabentyp ist noch nicht implementiert.")
     return None
 
 # =========================
-# Streamlit App
+# App
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+
 st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
 
@@ -303,112 +318,100 @@ with st.sidebar:
     user_id = st.text_input("User-ID", value="demo_schueler" if role == "student" else "demo_lehrkraft")
     display_name = st.text_input("Name", value="Demo")
     class_code = st.text_input("Klasse/Kurs (Code)", value="GPA-TEST")
-    easy_mode = st.toggle("Einfache Sprache (A2/B1-ähnlich)", value=False)
+    easy_mode = st.toggle("Einfache Sprache", value=False)
     if st.button("Einloggen"):
         upsert_user(conn, user_id, role, display_name, class_code)
         st.success("Eingeloggt.")
 
-# Persist user regardless (so teacher can see demo quickly)
 upsert_user(conn, user_id, role, display_name, class_code)
 
 my_attempts = get_attempts(conn, user_id=user_id)
 profile = compute_profile(my_attempts)
 seen_ids = set(my_attempts["item_id"].tolist()) if not my_attempts.empty else set()
 
-tabs = st.tabs(["Schüler:in", "Lehrkraft", "Itembank"])
+tabs = st.tabs(["Schüler:in", "Lehrkraft"])
 
-# -------------------------
-# Schüler
-# -------------------------
 with tabs[0]:
     st.subheader("Schülerbereich")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Bearbeitete Aufgaben", int(len(my_attempts)))
-    c2.metric("Ø richtig", round(float(my_attempts["correct"].mean()) if not my_attempts.empty else 0.0, 2))
-    c3.metric("Items in Bank", len(items))
+    st.markdown("### 1) Lernfeld auswählen")
+    field_id = st.selectbox(
+        "Wähle dein Lernfeld:",
+        [x for (x, _n) in LEARN_FIELDS],
+        format_func=lambda x: f"{x} – {lf_name.get(x, x)}"
+    )
+    render_header_card(field_id)
 
-    st.markdown("### 1) Diagnostik (Mix: Operatoren + Sprache + Kognition + Fachwissen)")
-    diag_len = st.slider("Diagnostik-Länge", min_value=10, max_value=30, value=20, step=5)
-
-    if st.button("Diagnostik starten"):
-        domains = ["OPS", "SPR", "KOG", "FACH"]
-        diag_items: List[Dict[str, Any]] = []
-        per_domain = max(2, diag_len // 5)
-        for d in domains:
-            cand = [it for it in items if it["domain"] == d]
-            if cand:
-                diag_items.extend(random.sample(cand, k=min(per_domain, len(cand))))
-        rest = diag_len - len(diag_items)
-        if rest > 0:
-            diag_items.extend(random.sample(items, k=min(rest, len(items))))
-        random.shuffle(diag_items)
-        st.session_state["diag_items"] = diag_items[:diag_len]
-        st.session_state["diag_i"] = 0
-
-    diag_items = st.session_state.get("diag_items", [])
-    if diag_items:
-        i = st.session_state.get("diag_i", 0)
-        st.progress((i + 1) / len(diag_items))
-        it = diag_items[i]
-        res = render_item(it, easy_mode=easy_mode, key_prefix="diag_")
-        if res is not None:
-            log_attempt(conn, user_id, class_code, it, res["correct"], {"mode": "diagnostic", **res["response"]})
-            if i + 1 < len(diag_items):
-                st.session_state["diag_i"] = i + 1
-                st.rerun()
-            else:
-                st.success("Diagnostik abgeschlossen ✅")
-                st.session_state["diag_items"] = []
-                st.session_state["diag_i"] = 0
-
-    st.markdown("### 2) Lernfeld wählen & adaptiv üben (Mix aus Spiel + Prüfung)")
-    lf = st.selectbox("Lernfeld", [x for (x, _n) in LEARN_FIELDS], format_func=lambda x: f"{x} – {lf_name.get(x,x)}")
-    dom = st.selectbox("Fokus", [x for (x, _n) in DOMAINS], format_func=lambda x: f"{x} – {domain_name.get(x,x)}")
-
-    lvl = profile.get((lf, dom), {}).get("level", 1)
-    acc = profile.get((lf, dom), {}).get("accuracy", None)
-    st.info(f"Aktuelle Schätzung in {lf}/{dom}: Level **{lvl}**" + (f" · Accuracy ~ {acc}" if acc is not None else ""))
-
-    practice_len = st.slider("Übungsrunde", min_value=5, max_value=15, value=8, step=1)
-
-    if st.button("Adaptive Runde starten"):
-        chosen = pick_items_adaptive(items, profile, field_id=lf, focus_domain=dom, already_seen=seen_ids, k=practice_len)
-        st.session_state["prac_items"] = chosen
-        st.session_state["prac_i"] = 0
-
-    prac_items = st.session_state.get("prac_items", [])
-    if prac_items:
-        i = st.session_state.get("prac_i", 0)
-        st.progress((i + 1) / len(prac_items))
-        it = prac_items[i]
-        res = render_item(it, easy_mode=easy_mode, key_prefix="prac_")
-        if res is not None:
-            log_attempt(conn, user_id, class_code, it, res["correct"], {"mode": "practice", **res["response"]})
-            if i + 1 < len(prac_items):
-                st.session_state["prac_i"] = i + 1
-                st.rerun()
-            else:
-                st.success("Übungsrunde abgeschlossen 🎉")
-                st.session_state["prac_items"] = []
-                st.session_state["prac_i"] = 0
-
-    st.markdown("### 3) Dein Profil (pro Lernfeld + Bereich)")
-    rows = []
-    for (f, d), v in sorted(profile.items()):
-        rows.append({
-            "Lernfeld": f"{f} – {lf_name.get(f,f)}",
-            "Bereich": f"{d} – {domain_name.get(d,d)}",
+    st.markdown("### Dein aktueller Stand in diesem Lernfeld")
+    lf_rows = []
+    for dom in ["OPS", "SPR", "KOG", "FACH"]:
+        v = profile.get((field_id, dom), {"level": 1, "accuracy": 0.0, "n": 0})
+        lf_rows.append({
+            "Bereich": domain_name.get(dom, dom),
             "Level": v["level"],
-            "Accuracy": v["accuracy"],
-            "n": v["n"],
+            "Trefferquote": v["accuracy"],
+            "Aufgaben": v["n"]
         })
-    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Lernfeld","Bereich","Level","Accuracy","n"]),
-                 use_container_width=True)
+    st.dataframe(pd.DataFrame(lf_rows), use_container_width=True, hide_index=True)
 
-# -------------------------
-# Lehrkraft
-# -------------------------
+    st.markdown("### 2) Lernstand im Lernfeld erheben")
+    diag_len = st.slider("Anzahl Aufgaben (Diagnostik)", 8, 20, 12, 2)
+
+    colA, colB = st.columns([1, 1])
+    with colA:
+        if st.button("Lernstand starten"):
+            diag_items = pick_items_for_diagnostic(items, field_id, diag_len)
+            st.session_state["flow_mode"] = "diagnostic"
+            st.session_state["flow_field"] = field_id
+            st.session_state["flow_items"] = diag_items
+            st.session_state["flow_i"] = 0
+            st.rerun()
+
+    with colB:
+        if st.button("Diagnostik zurücksetzen (nur mich)"):
+            conn.execute("DELETE FROM attempts WHERE user_id=? AND field_id=?", (user_id, field_id))
+            conn.commit()
+            st.success("Zurückgesetzt. Bitte Seite neu laden.")
+            st.stop()
+
+    flow_items = st.session_state.get("flow_items", [])
+    flow_i = st.session_state.get("flow_i", 0)
+    flow_mode = st.session_state.get("flow_mode", None)
+    flow_field = st.session_state.get("flow_field", None)
+
+    if flow_items and flow_field == field_id:
+        st.markdown("---")
+        st.markdown("### Aufgabe")
+        st.progress((flow_i + 1) / len(flow_items))
+        it = flow_items[flow_i]
+        res = render_item(it, easy_mode=easy_mode, key_prefix=f"flow_{flow_mode}_")
+        if res is not None:
+            log_attempt(conn, user_id, class_code, it, res["correct"], res["response"], mode=flow_mode)
+            if flow_i + 1 < len(flow_items):
+                st.session_state["flow_i"] = flow_i + 1
+                st.rerun()
+            else:
+                st.success("Fertig ✅")
+                st.session_state["flow_items"] = []
+                st.session_state["flow_i"] = 0
+                st.session_state["flow_mode"] = None
+                st.session_state["flow_field"] = None
+                st.rerun()
+
+    st.markdown("### 3) Passende Aufgaben üben")
+    practice_len = st.slider("Übungsrunde", 5, 15, 8, 1)
+
+    if st.button("Übungsrunde starten"):
+        my_attempts2 = get_attempts(conn, user_id=user_id)
+        profile2 = compute_profile(my_attempts2)
+        seen2 = set(my_attempts2["item_id"].tolist()) if not my_attempts2.empty else set()
+        chosen = pick_items_adaptive(items, profile2, field_id=field_id, already_seen=seen2, k=practice_len)
+        st.session_state["flow_mode"] = "practice"
+        st.session_state["flow_field"] = field_id
+        st.session_state["flow_items"] = chosen
+        st.session_state["flow_i"] = 0
+        st.rerun()
+
 with tabs[1]:
     st.subheader("Lehrkraft-Dashboard")
 
@@ -424,94 +427,29 @@ with tabs[1]:
     c2.metric("Versuche gesamt", int(len(class_attempts)))
     c3.metric("Items in Bank", len(items))
 
-    st.markdown("### Klassenübersicht (Profil-Snapshot)")
-    if not class_users.empty:
-        overview_rows = []
-        for sid in class_users["user_id"].tolist():
-            s_attempts = get_attempts(conn, user_id=sid)
-            s_prof = compute_profile(s_attempts)
-
-            def avg_level(domain_id: str) -> float:
-                vals = [v["level"] for (f, d), v in s_prof.items() if d == domain_id]
-                return round(sum(vals) / len(vals), 2) if vals else 1.0
-
-            overview_rows.append({
-                "User-ID": sid,
-                "Name": class_users[class_users["user_id"] == sid]["display_name"].iloc[0],
-                "Ø Level OPS": avg_level("OPS"),
-                "Ø Level SPR": avg_level("SPR"),
-                "Ø Level KOG": avg_level("KOG"),
-                "Ø Level FACH": avg_level("FACH"),
-                "Versuche": int(len(s_attempts))
-            })
-        st.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
-
-        st.markdown("### Einzelprofil")
+    if class_users.empty:
+        st.info("Noch keine Schüler:innen in dieser Klasse. (Sie loggen sich mit dem Klassen-Code ein.)")
+    else:
         sid = st.selectbox("Schüler:in auswählen", class_users["user_id"].tolist())
         s_attempts = get_attempts(conn, user_id=sid)
         s_prof = compute_profile(s_attempts)
 
-        st.write("**Letzte 20 Versuche**")
-        if not s_attempts.empty:
-            show = s_attempts.copy()
-            show["created_at"] = pd.to_datetime(show["created_at"])
-            st.dataframe(show[["attempt_id","item_id","field_id","domain_id","difficulty","correct","created_at"]].head(20),
-                         use_container_width=True)
-        else:
-            st.info("Noch keine Daten.")
-
-        st.write("**Kompetenzprofil**")
+        st.write("**Kompetenzprofil (pro Lernfeld & Bereich)**")
         rows = []
-        for (f, d), v in sorted(s_prof.items()):
-            rows.append({
-                "Lernfeld": f"{f} – {lf_name.get(f,f)}",
-                "Bereich": f"{d} – {domain_name.get(d,d)}",
-                "Level": v["level"],
-                "Accuracy": v["accuracy"],
-                "n": v["n"],
-            })
-        st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Lernfeld","Bereich","Level","Accuracy","n"]),
-                     use_container_width=True)
+        for (lf, _n) in LEARN_FIELDS:
+            for dom in ["OPS","SPR","KOG","FACH"]:
+                v = s_prof.get((lf, dom), {"level": 1, "accuracy": 0.0, "n": 0})
+                rows.append({
+                    "Lernfeld": f"{lf} – {lf_name.get(lf, lf)}",
+                    "Bereich": domain_name.get(dom, dom),
+                    "Level": v["level"],
+                    "Trefferquote": v["accuracy"],
+                    "Aufgaben": v["n"],
+                })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         st.markdown("### Export (CSV)")
-        export = class_attempts.copy()
-        csv_bytes = export.to_csv(index=False).encode("utf-8")
+        csv_bytes = class_attempts.to_csv(index=False).encode("utf-8")
         st.download_button("CSV herunterladen", data=csv_bytes, file_name=f"export_{chosen_class}.csv", mime="text/csv")
-    else:
-        st.info("Noch keine Schüler:innen in dieser Klasse. (Schüler:innen loggen sich mit Klassen-Code ein.)")
 
-# -------------------------
-# Itembank
-# -------------------------
-with tabs[2]:
-    st.subheader("Itembank")
-    st.write("Items werden aus der DB geladen (Tabelle: items).")
-
-    f = st.selectbox("Filter Lernfeld", ["(alle)"] + [x for (x,_n) in LEARN_FIELDS])
-    d = st.selectbox("Filter Bereich", ["(alle)"] + [x for (x,_n) in DOMAINS])
-    diff = st.selectbox("Filter Schwierigkeit", ["(alle)"] + [1,2,3])
-
-    filtered = []
-    for it in items:
-        if f != "(alle)" and it["field"] != f:
-            continue
-        if d != "(alle)" and it["domain"] != d:
-            continue
-        if diff != "(alle)" and int(it["difficulty"]) != int(diff):
-            continue
-        filtered.append(it)
-
-    st.write(f"Gefundene Items: {len(filtered)}")
-    rows = []
-    for it in filtered[:50]:
-        rows.append({
-            "id": it["id"],
-            "LF": it["field"],
-            "Bereich": it["domain"],
-            "Diff": it["difficulty"],
-            "Typ": it["type"],
-            "Prompt": it.get("prompt","")
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-st.caption("Hosting-Hinweis: Für einen teilbaren Link brauchst du Deployment (z. B. Streamlit Community Cloud).")
+st.caption("Prototype: Aufgabentypen werden schülerfreundlich benannt (Quiz/Zuordnen/…).")
